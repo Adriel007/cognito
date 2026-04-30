@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cognito-kv"
+version = "0.1.0"
+description = "Application-level KV cache paging for long-context LLM inference"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+
+# torch and transformers are declared as OPTIONAL so pip does not force
+# a specific version on projects that already have them installed.
+# The user's existing torch/transformers is used at runtime.
+dependencies = []
+
+[project.optional-dependencies]
+# pip install cognito-kv[cuda]   — CUDA + NF4 quantization (T4, A100, etc.)
+cuda = [
+    "torch>=2.0",
+    "transformers>=4.46",
+    "accelerate>=0.34",
+    "bitsandbytes>=0.44",
+]
+# pip install cognito-kv[cpu]    — CPU only, no quantization
+cpu = [
+    "torch>=2.0",
+    "transformers>=4.46",
+]
+# pip install cognito-kv[gemma4] — Gemma 4 / Qwen3.5 hybrid models
+gemma4 = [
+    "torch>=2.0",
+    "transformers>=5.5",
+    "accelerate>=0.40",
+]
+# pip install cognito-kv[dev]    — testing and compilation tools
+dev = [
+    "cognito-kv[cuda]",
+    "mypy>=1.10",
+    "mypyc",
+    "nuitka>=2.4",
+    "pytest>=8.0",
+]
+
+[project.urls]
+Repository = "https://github.com/Adriel007/cognito"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognito.py"]
+
+# ── uv workspace (keeps cognito isolated from host projects) ──────────────────
+# Add to the consuming project's pyproject.toml:
+#   [tool.uv.sources]
+#   cognito-kv = { path = "../cognito", editable = true }
+#
+# Or pin to a git commit:
+#   cognito-kv = { git = "https://github.com/Adriel007/cognito", rev = "main" }
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true   # torch stubs not required
+
+# ── Nuitka compilation profile ────────────────────────────────────────────────
+# python -m nuitka --module cognito.py --output-dir=dist/
+# Produces cognito.so (Linux) / cognito.pyd (Windows) — no source exposed.
+# To include torch in the binary (self-contained, ~2 GB):
+#   --include-package=torch --include-package=transformers
+[tool.nuitka]
+module = true
+output-dir = "dist"
+show-progress = false
+no-pyi-file = true
