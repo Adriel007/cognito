@@ -119,16 +119,30 @@ class BenchItem:
         return "\n\n".join(f"[{i + 1}] {p}" for i, p in enumerate(self.passages))
 
 
+def _gen_value(kind: str, rng: random.Random) -> str:
+    """Answer surface form. Lets us test whether robustness (e.g. Knorm) depends on
+    the answer being a NUMBER specifically, or generalizes across surface forms."""
+    if kind == "code":   # 4-digit decimal
+        return f"{rng.randint(1000, 9999)}"
+    if kind == "hex":    # 4 hex chars (uppercase)
+        return "".join(rng.choice("0123456789ABCDEF") for _ in range(4))
+    if kind == "alnum":  # mixed letters+digits token
+        return "".join(rng.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(5))
+    raise ValueError(f"unknown answer_kind: {kind}")
+
+
 def build_dataset(n_queries: int = 100, n_passages: int = 8, n_hard: int = 2,
-                  passage_words: int = 80, seed: int = 0) -> list[BenchItem]:
+                  passage_words: int = 80, seed: int = 0,
+                  answer_kind: str = "code") -> list[BenchItem]:
     """Deterministic adversarial dataset. Gold answer-bearing but low-overlap;
-    n_hard query-echoing answerless distractors; rest filler; gold at random slot."""
+    n_hard query-echoing answerless distractors; rest filler; gold at random slot.
+    `answer_kind` ∈ {code, hex, alnum} varies only the answer surface form."""
     assert 1 + n_hard <= n_passages, "need room for gold + hard-negatives"
     rng = random.Random(seed)
     items: list[BenchItem] = []
     for qi in range(n_queries):
         tag = f"{rng.randint(100, 999)}{qi:03d}"
-        value = f"{rng.randint(1000, 9999)}"
+        value = _gen_value(answer_kind, rng)
         query = QUERY_TEMPLATE.format(tag=tag)
         gold = GOLD_TEMPLATE.format(tag=tag, value=value)
         gold = (gold + " " + _filler(max(0, passage_words - len(gold.split())), rng)).strip()
@@ -160,8 +174,9 @@ def normalize(s: str) -> str:
 
 
 def exact_match(prediction: str, gold_value: str) -> bool:
-    """The answer is a 4-digit code; EM = the code appears as a token in the output."""
-    return gold_value in normalize(prediction).split()
+    """EM = the gold value (case-insensitive) appears as a token in the output.
+    Works for code/hex/alnum surface forms (normalize lowercases both sides)."""
+    return gold_value.lower() in normalize(prediction).split()
 
 
 # ── Adversarial-property diagnostic (optional, needs rank_bm25) ─────────────
@@ -206,10 +221,12 @@ def _main():
     ap.add_argument("--n_hard", type=int, default=2)
     ap.add_argument("--passage_words", type=int, default=80)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--answer_kind", type=str, default="code", choices=["code", "hex", "alnum"])
     ap.add_argument("--diagnostic", action="store_true", help="report BM25 gold-rank")
     args = ap.parse_args()
 
-    ds = build_dataset(args.n, args.n_passages, args.n_hard, args.passage_words, args.seed)
+    ds = build_dataset(args.n, args.n_passages, args.n_hard, args.passage_words,
+                       args.seed, args.answer_kind)
     if args.diagnostic:
         diag = attach_bm25_ranks(ds)
         print("[adversarial-property diagnostic]", json.dumps(diag, indent=2))

@@ -18,28 +18,29 @@ import torch
 import kvpress  # noqa: F401 — registers the "kv-press-text-generation" pipeline task
 import answer_presence_bench as bench
 
-INSTR = ("You are a precise assistant. Using ONLY the context, output the numeric "
-         "code/key recorded for the unit. Answer with the number ONLY.")
+INSTR = ("You are a precise assistant. Using ONLY the context, output the access "
+         "code/key recorded for the unit. Answer with that value ONLY.")
 def make_ctx(it): return INSTR + "\n\nContext:\n" + it.context()
-def ask(it):      return f"What number was recorded as the access key/code for unit {it.tag}?"
+def ask(it):      return f"What value was recorded as the access key/code for unit {it.tag}?"
 
 
-def build_pipe():
+def build_pipe(model: str, attn: str = "eager", four_bit: bool = True):
     from transformers import pipeline, BitsAndBytesConfig
-    qcfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                              bnb_4bit_compute_dtype=torch.float16,
-                              bnb_4bit_use_double_quant=True)
-    return pipeline("kv-press-text-generation", model="mistralai/Mistral-7B-Instruct-v0.3",
-                    device_map="auto", model_kwargs=dict(quantization_config=qcfg,
-                    dtype=torch.float16, attn_implementation="eager"))
+    mk = dict(dtype=torch.float16, attn_implementation=attn)
+    if four_bit:
+        mk["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
+    return pipeline("kv-press-text-generation", model=model, device_map="auto", model_kwargs=mk)
 
 
-def make_panel(r):
-    """Presses that run cleanly on T4/4-bit/eager. Wrappers (AdaKV/ChunkKV/Critical)
-    have attention-mode conflicts in this config and are recorded as N/A."""
+def make_panel(r, include_wrappers: bool = False):
+    """Core presses run cleanly on eager. Wrappers (AdaKV/ChunkKV/Critical — the
+    DefensiveKV/ChunkKV lineage) are attempted only when include_wrappers=True
+    (they need specific attn modes); failures are caught per-press."""
     from kvpress import (SnapKVPress, ExpectedAttentionPress, PyramidKVPress,
                          ObservedAttentionPress, KnormPress, StreamingLLMPress, TOVAPress)
-    return {
+    P = {
         "SnapKV":        SnapKVPress(compression_ratio=r),
         "ExpectedAttn":  ExpectedAttentionPress(compression_ratio=r),
         "PyramidKV":     PyramidKVPress(compression_ratio=r),
@@ -48,6 +49,15 @@ def make_panel(r):
         "StreamingLLM":  StreamingLLMPress(compression_ratio=r),
         "Knorm":         KnormPress(compression_ratio=r),
     }
+    if include_wrappers:
+        from kvpress import AdaKVPress, ChunkKVPress, CriticalKVPress
+        def add(n, f):
+            try: P[n] = f()
+            except Exception as e: print(f"  [wrapper skip {n}] {str(e)[:70]}", flush=True)
+        add("AdaKV-SnapKV",   lambda: AdaKVPress(SnapKVPress(compression_ratio=r)))
+        add("ChunkKV-SnapKV", lambda: ChunkKVPress(SnapKVPress(compression_ratio=r)))
+        add("CriticalKV-Snap",lambda: CriticalKVPress(SnapKVPress(compression_ratio=r)))
+    return P
 
 
 def main():
@@ -57,15 +67,23 @@ def main():
     ap.add_argument("--n_hard", type=int, default=2)
     ap.add_argument("--passage_words", type=int, default=80)
     ap.add_argument("--ratios", type=str, default="0.25,0.5,0.75")
+    ap.add_argument("--model", type=str, default="mistralai/Mistral-7B-Instruct-v0.3")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--answer_kind", type=str, default="code", choices=["code","hex","alnum"])
+    ap.add_argument("--attn", type=str, default="eager")
+    ap.add_argument("--fp16", action="store_true", help="load in fp16 (no 4-bit) — for small models")
+    ap.add_argument("--wrappers", action="store_true", help="also try AdaKV/ChunkKV/CriticalKV")
     ap.add_argument("--out", type=str, default="kvpress_audit.jsonl")
     args = ap.parse_args()
     ratios = [float(x) for x in args.ratios.split(",")]
 
-    ds = bench.build_dataset(args.n, args.n_passages, args.n_hard, args.passage_words, seed=0)
+    ds = bench.build_dataset(args.n, args.n_passages, args.n_hard, args.passage_words,
+                             seed=args.seed, answer_kind=args.answer_kind)
     diag = bench.attach_bm25_ranks(ds)
-    print(f"[bench] n={len(ds)} | adversarial diagnostic: {json.dumps(diag)}", flush=True)
+    print(f"[bench] model={args.model} seed={args.seed} kind={args.answer_kind} n={len(ds)} "
+          f"| adversarial: {json.dumps(diag)}", flush=True)
 
-    pipe = build_pipe()
+    pipe = build_pipe(args.model, attn=args.attn, four_bit=not args.fp16)
     print(f"[pipe] built | attn={pipe.model.config._attn_implementation}", flush=True)
     fout = open(args.out, "w", encoding="utf-8")
     table = {}   # (method, ratio) -> [hits, n]
@@ -94,12 +112,15 @@ def main():
 
     for r in ratios:
         print(f"\n=== compression_ratio = {r} (keep {100*(1-r):.0f}%) ===", flush=True)
-        for method, press in make_panel(r).items():
+        for method, press in make_panel(r, include_wrappers=args.wrappers).items():
             run(method, r, press)
 
     fout.close()
-    # Final table
-    methods = ["SnapKV","ExpectedAttn","PyramidKV","ObservedAttn","TOVA","StreamingLLM","Knorm"]
+    # Final table — methods in first-seen order
+    methods = []
+    for (m, r) in table:
+        if m != "CEILING" and m not in methods:
+            methods.append(m)
     print("\n" + "#"*78 + "\n# ANSWER-PRESENCE AUDIT — EM% (rows=method, cols=compression)\n" + "#"*78, flush=True)
     ceil = table[("CEILING",0.0)]; print(f"  {'CEILING (full ctx)':<16} {100*ceil[0]/ceil[1]:5.1f}%", flush=True)
     header = "  " + f"{'method':<16}" + "".join(f" r={r:<5}" for r in ratios)
