@@ -15,6 +15,7 @@ Usage:  python run_kvpress_audit.py --n 40 --out kvpress_audit.jsonl
 from __future__ import annotations
 import argparse, json, sys, time, traceback
 import torch
+import kvpress  # noqa: F401 — registers the "kv-press-text-generation" pipeline task
 import answer_presence_bench as bench
 
 INSTR = ("You are a precise assistant. Using ONLY the context, output the numeric "
